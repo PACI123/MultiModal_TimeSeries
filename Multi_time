@@ -1,0 +1,358 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
+from transformers import AutoTokenizer, AutoModel
+import matplotlib.pyplot as plt
+
+# Data loading & Merging
+
+# ── Load ────────────────────────────────────────────────────────────
+ts_df = pd.read_csv('Energy.csv')
+tx_df = pd.read_csv('Energy_search.csv')
+
+# ── Parse dates ─────────────────────────────────────────────────────
+ts_df['date']            = pd.to_datetime(ts_df['date'])
+tx_df['start_date']      = pd.to_datetime(tx_df['start_date'])
+
+# ── Drop non-numeric TS columns ──────────────────────────────────────
+ts_df = ts_df.drop(columns=['start_date', 'end_date'])
+
+# ── Rename price columns ─────────────────────────────────────────────
+ts_df.columns = [
+    'date',
+    'OT', 'East_Coast', 'New_England', 'Central_Atlantic',
+    'Lower_Atlantic', 'Midwest', 'Gulf_Coast',
+    'Rocky_Mountain', 'West_Coast'
+]
+
+# ── Merge on date ────────────────────────────────────────────────────
+merged = ts_df.merge(
+    tx_df[['start_date', 'fact', 'preds']],
+    left_on='date', right_on='start_date', how='left'
+)
+
+# ── Build combined text per row ──────────────────────────────────────
+def build_text(row):
+    parts = []
+    if pd.notna(row['fact']):
+        parts.append(str(row['fact']).strip())
+    pred = str(row.get('preds', '')).strip()
+    if pred and not pred.startswith('NA'):
+        short = pred.split(';')[0].strip()   # first prediction sentence only
+        if short and short != 'NA':
+            parts.append(short)
+    return ' '.join(parts) if parts else 'Energy market conditions this week.'
+
+merged['text'] = merged.apply(build_text, axis=1)
+
+# ── Final arrays ─────────────────────────────────────────────────────
+feature_cols = ['OT','East_Coast','New_England','Central_Atlantic',
+                'Lower_Atlantic','Midwest','Gulf_Coast',
+                'Rocky_Mountain','West_Coast']
+
+ts_values = merged[feature_cols].values     # (1622, 9)
+texts     = merged['text'].tolist()         # list of 1622 strings
+
+print(f"TS shape : {ts_values.shape}")
+print(f"Texts    : {len(texts)}")
+print(f"Sample   : {texts[100][:120]}")
+
+# Configuration
+
+SEQ_LEN      = 104   # 2 years of weekly lookback
+PRED_LEN     = 12    # 12-week (3-month) forecast
+PATCH_LEN    = 8     # 8-week patch
+STRIDE       = 4     # 50% overlap → 25 patches per window
+D_MODEL      = 128
+N_HEADS      = 8
+BATCH        = 16
+NUM_VARIATES = 9
+
+# Patch embedding
+
+class PatchEmbedding(nn.Module):
+    def __init__(self, patch_len=8, stride=4, d_model=128, dropout=0.1):
+        super().__init__()
+        self.patch_len  = patch_len
+        self.stride     = stride
+        self.projection = nn.Linear(patch_len, d_model)
+        self.dropout    = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        x = x.permute(0, 2, 1)                        # (B, C, T)
+        x = x.unfold(2, self.patch_len, self.stride)   # (B, C, N, P)
+        B, C, N, P = x.shape
+        x = x.reshape(B * C, N, P)
+        return self.projection(x), N, B, C             # (B*C, N, d_model)
+
+# text encoder
+class TextEncoder(nn.Module):
+    def __init__(self, d_model=128, bert_model='bert-base-uncased'):
+        super().__init__()
+        self.tokenizer = AutoTokenizer.from_pretrained(bert_model)
+        self.bert      = AutoModel.from_pretrained(bert_model)
+
+        for p in self.bert.parameters():
+            p.requires_grad = False              # keep BERT frozen
+
+        self.proj = nn.Sequential(
+            nn.Linear(768, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+
+    @property
+    def device(self):
+        return next(self.proj.parameters()).device
+
+    def forward(self, texts):
+        enc = self.tokenizer(
+            texts, return_tensors='pt',
+            padding=True, truncation=True, max_length=128
+        )
+        enc = {k: v.to(self.device) for k, v in enc.items()}
+        with torch.no_grad():
+            out = self.bert(**enc)
+        mask = enc['attention_mask'].unsqueeze(-1).float()
+        emb  = (out.last_hidden_state * mask).sum(1) / mask.sum(1)
+        return self.proj(emb).unsqueeze(1)       # (B, 1, d_model)
+
+        # cross-attention fusion
+class CrossAttentionFusion(nn.Module):
+    def __init__(self, d_model=128, n_heads=8, d_ff=256, dropout=0.1):
+        super().__init__()
+        self.attn  = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ff    = nn.Sequential(
+            nn.Linear(d_model, d_ff), nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model), nn.Dropout(dropout),
+        )
+
+    def forward(self, patch_tokens, text_token):
+        attn_out, _ = self.attn(patch_tokens, text_token, text_token)
+        x = self.norm1(patch_tokens + attn_out)
+        x = self.norm2(x + self.ff(x))
+        return x
+
+        # full model
+class TSTextPatchTST(nn.Module):
+    def __init__(
+        self,
+        num_variates    = 9,
+        seq_len         = 104,
+        pred_len        = 12,
+        patch_len       = 4,
+        #patch_len       = 8,
+        stride          = 4,
+        d_model         = 128,
+        n_heads         = 8,
+        num_ts_layers   = 3,
+        num_fuse_layers = 2,
+        d_ff            = 256,
+        dropout         = 0.1,
+        bert_model      = 'bert-base-uncased',
+    ):
+        super().__init__()
+        self.num_variates = num_variates
+        self.pred_len     = pred_len
+        num_patches = (seq_len - patch_len) // stride + 1   # = 25
+
+        self.patch_embed = PatchEmbedding(patch_len, stride, d_model, dropout)
+        self.pos_embed   = nn.Parameter(torch.zeros(1, num_patches, d_model))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+
+        ts_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads,
+            dim_feedforward=d_ff, dropout=dropout,
+            batch_first=True, norm_first=True,
+        )
+        self.ts_encoder     = nn.TransformerEncoder(ts_layer, num_layers=num_ts_layers)
+        self.text_encoder   = TextEncoder(d_model, bert_model)
+        self.fusion_layers  = nn.ModuleList([
+            CrossAttentionFusion(d_model, n_heads, d_ff, dropout)
+            for _ in range(num_fuse_layers)
+        ])
+        self.head = nn.Sequential(
+            nn.Flatten(start_dim=-2),
+            nn.Linear(num_patches * d_model, pred_len),
+        )
+
+    def forward(self, x_ts, texts):
+        B, T, C = x_ts.shape
+
+        # Instance norm
+        means = x_ts.mean(1, keepdim=True).detach()
+        stdev = (x_ts.var(1, keepdim=True, unbiased=False) + 1e-5).sqrt().detach()
+        x_ts  = (x_ts - means) / stdev
+
+        # Patch + positional encoding
+        x, N, B_, C_ = self.patch_embed(x_ts)    # (B*C, N, d_model)
+        x = x + self.pos_embed[:, :N]
+
+        # TS self-attention
+        x = self.ts_encoder(x)                   # (B*C, N, d_model)
+
+        # Text token → expand to every variate
+        text_tok = self.text_encoder(texts)       # (B, 1, d_model)
+        text_tok = (text_tok
+                    .unsqueeze(1)
+                    .expand(B, C, 1, -1)
+                    .reshape(B * C, 1, -1))       # (B*C, 1, d_model)
+
+        # Cross-attention fusion
+        for layer in self.fusion_layers:
+            x = layer(x, text_tok)               # (B*C, N, d_model)
+
+        # Predict
+        out = self.head(x)                        # (B*C, pred_len)
+        out = out.reshape(B, C, self.pred_len).permute(0, 2, 1)
+
+        return out * stdev + means                # (B, pred_len, C)
+
+        # Datasets -allingned text
+
+class EnergyDataset(Dataset):
+    def __init__(self, ts_data, text_list, seq_len=104, pred_len=12):
+        self.ts       = torch.tensor(ts_data,  dtype=torch.float32)
+        self.texts    = text_list               # aligned list of strings
+        self.seq_len  = seq_len
+        self.pred_len = pred_len
+
+    def __len__(self):
+        return len(self.ts) - self.seq_len - self.pred_len + 1
+
+    def __getitem__(self, idx):
+        x    = self.ts[idx             : idx + self.seq_len]
+        y    = self.ts[idx + self.seq_len : idx + self.seq_len + self.pred_len]
+        # Use the text at the END of the lookback window (most recent context)
+        text = self.texts[idx + self.seq_len - 1]
+        return x, y, text
+
+def collate_fn(batch):
+    xs, ys, texts = zip(*batch)
+    return torch.stack(xs), torch.stack(ys), list(texts)
+
+    # Split,scale, load
+
+scaler = StandardScaler()
+n      = len(ts_values)
+
+train_vals = scaler.fit_transform(ts_values[:int(0.7*n)])     # ~1135 rows
+val_vals   = scaler.transform(ts_values[int(0.7*n):int(0.8*n)])
+test_vals  = scaler.transform(ts_values[int(0.8*n):])
+
+train_texts = texts[:int(0.7*n)]
+val_texts   = texts[int(0.7*n):int(0.8*n)]
+test_texts  = texts[int(0.8*n):]
+
+train_loader = DataLoader(
+    EnergyDataset(train_vals, train_texts, SEQ_LEN, PRED_LEN),
+    batch_size=BATCH, shuffle=True, collate_fn=collate_fn, drop_last=True
+)
+val_loader = DataLoader(
+    EnergyDataset(val_vals, val_texts, SEQ_LEN, PRED_LEN),
+    batch_size=BATCH, shuffle=False, collate_fn=collate_fn
+)
+test_loader = DataLoader(
+    EnergyDataset(test_vals, test_texts, SEQ_LEN, PRED_LEN),
+    batch_size=BATCH, shuffle=False, collate_fn=collate_fn
+)
+
+print(f"Train windows : {len(train_loader.dataset)}")
+print(f"Val   windows : {len(val_loader.dataset)}")
+print(f"Test  windows : {len(test_loader.dataset)}")
+
+# Training
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+model = TSTextPatchTST(
+    num_variates=NUM_VARIATES, seq_len=SEQ_LEN, pred_len=PRED_LEN,
+    patch_len=PATCH_LEN, stride=STRIDE, d_model=D_MODEL, n_heads=N_HEADS,
+    num_ts_layers=3, num_fuse_layers=2, d_ff=256, dropout=0.1,
+).to(device)
+
+optimizer = torch.optim.Adam(
+    filter(lambda p: p.requires_grad, model.parameters()),
+    lr=1e-2, weight_decay=1e-4
+)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, patience=4, factor=0.5
+)
+criterion = nn.MSELoss()
+
+best_val, patience_count = float('inf'), 0
+
+for epoch in range(1, 51):
+    model.train()
+    train_loss = 0
+    for x, y, texts_batch in train_loader:
+        x, y = x.to(device), y.to(device)
+        pred = model(x, texts_batch)
+        loss = criterion(pred, y)
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        train_loss += loss.item()
+
+    model.eval()
+    val_loss = 0
+    with torch.no_grad():
+        for x, y, texts_batch in val_loader:
+            val_loss += criterion(
+                model(x.to(device), texts_batch), y.to(device)
+            ).item()
+
+    train_loss /= len(train_loader)
+    val_loss   /= len(val_loader)
+    scheduler.step(val_loss)
+    print(f"Epoch {epoch:02d} | train {train_loss:.4f} | val {val_loss:.4f}")
+
+    if val_loss < best_val:
+        best_val = val_loss
+        torch.save(model.state_dict(), 'energy_ts_text_patchtst.pt')
+        patience_count = 0
+    else:
+        patience_count += 1
+        if patience_count >= 10:
+            print("Early stopping.")
+            break
+
+model.load_state_dict(torch.load('energy_ts_text_patchtst.pt'))
+model.eval()
+
+preds, trues = [], []
+with torch.no_grad():
+    for x, y, texts_batch in test_loader:
+        preds.append(model(x.to(device), texts_batch).cpu().numpy())
+        trues.append(y.numpy())
+
+preds = np.concatenate(preds)   # (N, pred_len, 9)
+trues = np.concatenate(trues)
+
+mse = np.mean((preds - trues) ** 2)
+mae = np.mean(np.abs(preds - trues))
+print(f"\nOverall  | MSE {mse:.4f}  MAE {mae:.4f}")
+print()
+
+for i, col in enumerate(feature_cols):
+    r_mse = np.mean((preds[:,:,i] - trues[:,:,i])**2)
+    r_mae = np.mean(np.abs(preds[:,:,i] - trues[:,:,i]))
+    print(f"  {col:<20s} | MSE {r_mse:.4f} | MAE {r_mae:.4f}")
+
+# Plot OT forecast
+plt.figure(figsize=(14, 4))
+plt.plot(trues[:80, :, 0].flatten(), label='Ground truth', alpha=0.85)
+plt.plot(preds[:80, :, 0].flatten(), label='PatchTST + Text', alpha=0.85)
+plt.title('Energy — OT 12-week forecast (test set)')
+plt.legend(); plt.tight_layout(); plt.show()
