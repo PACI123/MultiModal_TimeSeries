@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 ts_df = pd.read_csv('Energy.csv')
 tx_df = pd.read_csv('Energy_search.csv')
 
-# ── Parse dates ─────────────────────────────────────────────────────
+
 ts_df['date']            = pd.to_datetime(ts_df['date'])
 tx_df['start_date']      = pd.to_datetime(tx_df['start_date'])
 
